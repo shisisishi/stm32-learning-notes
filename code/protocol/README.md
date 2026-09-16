@@ -87,7 +87,7 @@ gcc -O2 -std=c99 -Wall -Wextra -o test_protocol test_protocol.c protocol.c
   平均每帧 8.0 字节
 
 ========================================
- 总计: 77 项通过, 0 项失败
+ 总计: 261 项通过, 0 项失败
  结果: ALL PASS
 ========================================
 ```
@@ -96,7 +96,7 @@ gcc -O2 -std=c99 -Wall -Wextra -o test_protocol test_protocol.c protocol.c
 
 > 说明一下我的编译环境：这台机器上装的是 zig 0.14.1（`zig cc` 用的就是 clang，
 > 命令行参数和 gcc 兼容），不是 MinGW 的 gcc。`-O2 -std=c99 -Wall -Wextra`
-> 零警告、77 项断言全通过都是在这个编译器上实测的。用 MinGW gcc 编译时
+> 零警告、261 项断言全通过都是在这个编译器上实测的。用 MinGW gcc 编译时
 > 可能有极个别的警告差异，**如果出现警告请以警告为准去改代码**。
 
 ## 测试覆盖了什么
@@ -113,6 +113,9 @@ gcc -O2 -std=c99 -Wall -Wextra -o test_protocol test_protocol.c protocol.c
 | 8 | 逐个翻转帧里每个字节，CRC 都要拦住 | 传输误码 |
 | 9 | `packed` 与默认对齐的 `sizeof` 差别 | 结构体直接 `memcpy` 发送的坑 |
 | 10 | 连续 300 帧按 SEQ 检查不丢帧 | 1 kHz 连续数据流 |
+| 11 | 边界载荷长度：`LEN = 0`（空载荷）与 `LEN = 32`（满载荷） | 载荷长度取到两端的极端情况 |
+| 12 | 假帧头被拒绝、截断帧能恢复 | 干扰后只收到半帧就断了 |
+| 13 | `NULL` 安全 / 复位语义 / 状态名 | 接口用错的时候不能崩、不能静默出错 |
 
 ## （可选）Python 上位机
 
@@ -183,8 +186,14 @@ if __name__ == "__main__":
 就是第 10 章说的"数据流可视化"。`pyqtgraph` 在 1 kHz 下明显比 `matplotlib` 流畅，
 因为它是基于 Qt 的 `QPainter` 直接画，不像 `matplotlib` 每帧重建整个 Figure。
 
-> 🔬 上面这段 Python 我只在 PC 上跑过 `crc8()` 与 `frames()` 的逻辑（喂构造好的字节流），
-> **没有接真实串口跑过**，因为板子和 USB-TTL 还没到手。真实串口的时间行为属于待验证。
+> **这段 Python 我验证到什么程度**：`crc8()` 和 `frames()` 这两个函数我在 PC 上跑过测试 ——
+> 喂进去的字节流是 C 那边 `test_protocol.exe` 真实打印出来的帧，覆盖了
+> 整帧 / 半包（每次只给 1~11 字节）/ 粘包 / 前面有垃圾字节 / 载荷含 `0xA5 0x5A` /
+> CRC 错误这 6 种情形，结果和 C 版本一致（`crc8()` 算出的校验字节正好等于帧尾那一字节）。
+>
+> **没验证的是真实串口的行为**：`serial.Serial("COM3", 115200, timeout=0.05)` 的参数取法、
+> 拔插 USB-TTL 时报什么异常、`in_waiting` 的实际取值，这些要等板子和 USB-TTL 到手才能测，
+> 属于 🔬 待验证。
 
 ## 接到 STM32 上要改什么
 

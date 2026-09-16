@@ -222,12 +222,21 @@ ProtoStatus Protocol_ParserFeed(ProtoParser *p, uint8_t byte)
         }
 
         /*
-         * 校验失败：整帧丢弃。
-         * 也可以只丢第一个字节然后重找帧头，但那样在持续干扰下可能反复重入，
-         * 直接回到 WAIT_SOF1 更省事，代价是丢掉紧跟着的那帧开头（下一字节会被当载荷）。
+         * 校验失败：这一帧作废，回去重找帧头。
+         *
+         * 这里和上面 READ_LEN 里"长度越界"那一条是同一个坑，必须同样处理：
+         * 刚收到的这个字节本身就可能是下一帧的帧头第 1 字节 0xA5。
+         * 最典型的情形是上一帧被截断（串口丢字节）：那帧的 CRC 字节根本没到，
+         * 解析器停在 VERIFY 等着，于是紧跟的新帧的 0xA5 正好落到这个 case 里。
+         * 如果这时直接回 WAIT_SOF1，这个 0xA5 就被吃掉，后面 5A 06 ... 全部错位，
+         * 结果是"丢 1 个字节 → 整整丢 2 帧"（审计实测：回调 0 次，两帧全没）。
+         * 回到 WAIT_SOF2 就把它当成候选帧头保留下来，新帧能被完整救回。
+         *
+         * 代价：CRC 字节恰好等于 0xA5 时，会多走一次 WAIT_SOF2 → READ_LEN 的
+         * 尝试，最后仍然会被 CRC 拦下，只是多花几个字节的时间。
          */
         p->crc_error_count++;
-        p->state = PROTO_ST_WAIT_SOF1;
+        p->state = (byte == PROTO_SOF1) ? PROTO_ST_WAIT_SOF2 : PROTO_ST_WAIT_SOF1;
         return PROTO_ERR_CRC;
     }
 

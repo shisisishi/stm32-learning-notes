@@ -5,17 +5,21 @@
  *   gcc -O2 -std=c99 -Wall -Wextra -o test_protocol test_protocol.c protocol.c
  *   ./test_protocol
  *
- * 这个程序验证 8 件事：
- *   1  CRC8 的分段续算与整体计算一致（这是解析器能分两段校验的前提）
+ * 这个程序验证这些事：
+ *   1  CRC8 的分段续算与整体计算一致（这是解析器能分两段校验的前提），
+ *      并用标准已知答案向量 CRC-8/ATM("123456789") == 0xF4 锚住算法本身
  *   2  打包字节偏移正确，LEN 字段确实等于载荷长度
  *   3  收完一帧能正确还原原始数据
- *   4  半包：一帧拆成两次喂给解析器，仍能解析出来
+ *   4  半包：一帧在任意位置拆开喂给解析器，仍能解析出来
  *   5  粘包：两帧连在一次喂进去，能解析出两帧
  *   6  载荷里故意插入 0xA5 0x5A，不会误同步（这一点最容易被写错）
  *   7  有干扰字节在前面时能重新同步
- *   8  CRC 错误能被检出，帧被丢弃
- *   +  结构体 packed 验证：默认对齐会让结构体变大
+ *   8  CRC 错误能被检出，帧被丢弃，且不会被计成解析成功
+ *   +  结构体 packed 验证：默认对齐会让结构体变大，真实帧结构体偏移逐个核对
  *   +  连续喂 300 帧不丢帧（环形缓冲那套逻辑的基础）
+ *   +  边界载荷长度：LEN = 0（零载荷）与 LEN = PROTO_MAX_PAYLOAD（满载荷）
+ *   +  假帧头拒绝（LEN 越界）与"截断帧之后紧跟的真帧必须被救回"
+ *   +  NULL 安全、复位语义、状态名全覆盖
  */
 #include <stdio.h>
 #include <string.h>
@@ -143,6 +147,19 @@ static void test_crc_continue(void)
 
     /* 传 NULL 时不能崩，也不能把已有结果清掉 */
     CHECK_EQ(Protocol_Crc8Continue(0x5Au, NULL, 0u), 0x5Au);
+    CHECK_EQ(Protocol_Crc8Continue(0x5Au, NULL, 7u), 0x5Au);
+
+    /*
+     * 用标准已知答案锚住算法：CRC-8/ATM 就是 CRC-8/SMBUS，
+     * 校验值 "123456789" 的公认结果是 0xF4。这条如果失败，
+     * 说明多项式/初值/位序被改错了 —— 那种错光靠"自己和自己比"是看不出来的。
+     */
+    {
+        static const uint8_t kat[] = "123456789";
+        CHECK_EQ(Protocol_Crc8(kat, 9u), 0xF4u);
+    }
+    CHECK_EQ(Protocol_Crc8(NULL, 0u), 0x00u);
+
     printf("  CRC8(11 字节) = 0x%02X\n", (unsigned)whole);
 }
 
@@ -183,6 +200,19 @@ static void test_pack_layout(void)
                            PROTO_MAX_PAYLOAD + 1u), 0u);
     CHECK_EQ(Protocol_Pack(frame, 4u, PROTO_CMD_ACK, 0u, payload, 6u), 0u);
     CHECK_EQ(Protocol_Pack(NULL, sizeof(frame), PROTO_CMD_ACK, 0u, payload, 6u), 0u);
+
+    /* out_size 的精确边界：刚好放得下必须成功，少 1 字节必须拒绝 */
+    CHECK_EQ(Protocol_Pack(frame, 12u, PROTO_CMD_ACK, 0u, payload, 6u), 12u);
+    CHECK_EQ(Protocol_Pack(frame, 11u, PROTO_CMD_ACK, 0u, payload, 6u), 0u);
+
+    /* 零载荷帧：payload 允许为 NULL，整帧 6 字节，校验落在偏移 5 */
+    CHECK_EQ(Protocol_Pack(frame, sizeof(frame), PROTO_CMD_ACK, 0u, NULL, 0u),
+             PROTO_OVERHEAD);
+    CHECK_EQ(frame[2], 0u);
+    CHECK_EQ(frame[PROTO_OVERHEAD - 1u], Protocol_Crc8(frame, PROTO_OVERHEAD - 1u));
+
+    /* 有载荷却传 NULL，必须拒绝（不能解引用空指针） */
+    CHECK_EQ(Protocol_Pack(frame, sizeof(frame), PROTO_CMD_ACK, 0u, NULL, 6u), 0u);
 }
 
 /* ================================================================== */
@@ -344,17 +374,43 @@ static void test_fake_sof_in_payload(void)
     CHECK_EQ(p.crc_error_count, 0u);
 
     /*
-     * 再逐字节喂一遍，逐字节喂才是难点：
-     * 真帧头在偏移 0，载荷里的假帧头在偏移 5。真帧收完、CRC 通过回调一次之后，
-     * 状态机回到 WAIT_SOF1 继续扫，会扫到载荷里那对 0xA5 0x5A 并当成候选帧头，
-     * 但算完 CRC 发现对不上就又丢掉了 —— 所以最终回调次数仍然是 1，
-     * 真数据一次都没被这串假帧头带偏。
+     * 再逐字节喂一遍，逐字节喂才是难点。
+     * 需要说清楚的是：整帧一次喂完时，载荷里那对 0xA5 0x5A 是被"当成载荷"吃掉的
+     * （READ_BODY 状态只按 LEN 计数，不再回头看载荷内容），所以它压根不会被当成
+     * 候选帧头 —— crc_error_count 保持 0 才是正确结果。
+     * 真正会撞上假帧头的是下面这种情况：帧收完之后，后面又来了 0xA5 0x5A。
      */
     cap_reset();
     Protocol_Init(&p, on_frame);
     Protocol_ParserFeedBuffer(&p, frame, n);
     CHECK_EQ(g_cap_n, 1);
     CHECK_EQ(p.frame_count, 1u);
+
+    /*
+     * 帧尾再接一段"假帧头 + 合法长度字段"的垃圾：
+     * 状态机会真的把它当候选帧来处理（A5 -> 5A -> LEN -> 收够 2+N 字节 -> 算 CRC），
+     * 算不过才丢掉。用 crc_error_count +1 来证明"确实试过并且拦住了"，
+     * 而不是"这段垃圾根本没被看"—— 后者才是真正的误同步隐患。
+     */
+    {
+        uint8_t junk[6];
+        junk[0] = PROTO_SOF1;
+        junk[1] = PROTO_SOF2;
+        junk[2] = 0u;                                    /* LEN = 0 */
+        junk[3] = 0x11u;                                 /* SEQ（伪） */
+        junk[4] = 0x22u;                                 /* CMD（伪） */
+        /* 故意把正确的校验值翻掉，保证它必然算不过，结果与平台无关 */
+        junk[5] = (uint8_t)(Protocol_Crc8(junk, 5u) ^ 0xFFu);
+
+        Protocol_Init(&p, on_frame);                     /* 接在上一帧之后继续 */
+        cap_reset();
+        CHECK_EQ(Protocol_ParserFeedBuffer(&p, frame, n), 1u);
+        CHECK_EQ(g_cap_n, 1);
+        CHECK_EQ(Protocol_ParserFeedBuffer(&p, junk, sizeof(junk)), 0u);
+        CHECK_EQ(g_cap_n, 1);                            /* 假帧头不许产生任何回调 */
+        CHECK_EQ(p.frame_count, 1u);
+        CHECK_EQ(p.crc_error_count, 1u);                 /* 假帧头被算过 CRC 并拦下 */
+    }
 }
 
 /* ================================================================== */
@@ -414,38 +470,59 @@ static void test_crc_error(void)
 
     n = Protocol_Pack(frame, sizeof(frame), PROTO_CMD_PID_DATA, 0x09u, payload, 6u);
 
-    /* 逐位翻转整帧里的每一个字节，除了帧头/长度/序号/命令之外都必须被检出 */
-    for (pos = 0u; pos < n; pos++) {
-        memcpy(bad, frame, n);
-        bad[pos] = (uint8_t)(bad[pos] ^ 0x01u);   /* 翻最低位 */
+    /*
+     * 逐位翻转整帧里的每一个字节的每一个位（12 字节 × 8 位 = 96 种干扰）：
+     * 既不许回调出数据，也不许被计成"解析成功"。
+     *
+     * 为什么能要求这么严：CRC 覆盖 [0, 5+N)，帧头/长度/序号/命令/载荷/校验
+     * 任何一个字节被改坏，收到的校验值都不可能再对上（CRC 能检出全部单字节错误）。
+     * 所以这里连 frame_count 一起断言 —— 只要有一个组合被放过去，测试必须红。
+     */
+    {
+        unsigned bit;
+        int      flip_fail = 0;
 
-        cap_reset();
-        Protocol_Init(&p, on_frame);
-        Protocol_ParserFeedBuffer(&p, bad, n);
+        for (pos = 0u; pos < n; pos++) {
+            for (bit = 0u; bit < 8u; bit++) {
+                memcpy(bad, frame, n);
+                bad[pos] = (uint8_t)(bad[pos] ^ (uint8_t)(1u << bit));
 
-        /*
-         * 帧头/长度/命令被改坏的情况，结果是"解析不出来"；
-         * 序号或载荷被改坏的情况，结果是"解析出来但 CRC 报错"。
-         * 两种情况都算拦住了 —— 关键是不能回调出一帧错误数据。
-         */
-        if (pos == 3u) {
-            /* 序号在偏移 3：改序号会让 CRC 失败，但帧仍然可能被当作一帧报错后丢弃 */
-            if (g_cap_n != 0) {
-                printf("  [FAIL] 偏移 %u（SEQ）被干扰却回调了数据\n", (unsigned)pos);
-                g_fail++;
-            } else {
-                g_pass++;
+                cap_reset();
+                Protocol_Init(&p, on_frame);
+                (void)Protocol_ParserFeedBuffer(&p, bad, n);
+
+                if ((g_cap_n != 0) || (p.frame_count != 0u)) {
+                    printf("  [FAIL] 偏移 %u 的第 %u 位被干扰却回调/计成功"
+                           "（回调 %d 次, frame_count=%u）\n",
+                           (unsigned)pos, bit, g_cap_n, (unsigned)p.frame_count);
+                    g_fail++;
+                    flip_fail++;
+                } else {
+                    g_pass++;
+                }
             }
-            continue;
         }
-        if (g_cap_n == 0) {
-            g_pass++;
+
+        /* 汇总必须真的看结果：这里以前是无条件打 [PASS]，失败了也照样打绿，纯误导 */
+        if (flip_fail == 0) {
+            printf("  [PASS] 逐个翻转 %u 个字节的全部 8 位（共 %u 种干扰），"
+                   "没有一次被误认为合法帧\n",
+                   (unsigned)n, (unsigned)(n * 8u));
         } else {
-            printf("  [FAIL] 偏移 %u 被干扰却回调了数据\n", (unsigned)pos);
-            g_fail++;
+            printf("  [FAIL] %d/%u 种干扰没被拦住\n",
+                   flip_fail, (unsigned)(n * 8u));
         }
     }
-    printf("  [PASS] 逐个翻转 %u 个字节，没有一次回调出错误数据\n", (unsigned)n);
+
+    /* 单独确认：改坏序号（偏移 3）也必须计一次 CRC 错误并被丢掉 */
+    memcpy(bad, frame, n);
+    bad[3] = (uint8_t)(bad[3] ^ 0x01u);
+    cap_reset();
+    Protocol_Init(&p, on_frame);
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, bad, n), 0u);
+    CHECK_EQ(g_cap_n, 0);
+    CHECK_EQ(p.crc_error_count, 1u);
+    CHECK_EQ(p.frame_count, 0u);
 
     /* 单独确认：载荷被改坏时，CRC 错误计数会 +1 */
     memcpy(bad, frame, n);
@@ -493,6 +570,28 @@ static void test_struct_packing(void)
                (unsigned)sizeof(DemoDefault),
                (unsigned)(sizeof(DemoDefault) - 3u));
     }
+
+    /*
+     * 上面那个 Demo 只是演示"对齐填充"这件事本身。真正决定线上字节流的是
+     * ProtoFrame / ProtoPidPayload —— 上位机 Python 按固定偏移解包，这两个结构体
+     * 的每一个偏移都必须钉死，漏一个 packed 就会整体错位。
+     */
+    CHECK_EQ(sizeof(ProtoFrame), PROTO_MAX_FRAME);
+    CHECK_EQ(offsetof(ProtoFrame, sof1), 0u);
+    CHECK_EQ(offsetof(ProtoFrame, sof2), 1u);
+    CHECK_EQ(offsetof(ProtoFrame, len), 2u);
+    CHECK_EQ(offsetof(ProtoFrame, seq), 3u);
+    CHECK_EQ(offsetof(ProtoFrame, cmd), 4u);
+    CHECK_EQ(offsetof(ProtoFrame, payload), 5u);
+    /* 校验字节是整帧的最后一个字节：载荷占 5 ~ 5+N-1，所以 CRC 在 5+N，
+     * 而整帧长度是 6+N（即 5+N+1）。这两个数差 1，最容易写错，这里钉死。 */
+    CHECK_EQ(offsetof(ProtoFrame, crc), 5u + PROTO_MAX_PAYLOAD);
+    CHECK_EQ(offsetof(ProtoFrame, crc), PROTO_MAX_FRAME - 1u);
+
+    CHECK_EQ(sizeof(ProtoPidPayload), 6u);
+    CHECK_EQ(offsetof(ProtoPidPayload, setpoint), 0u);
+    CHECK_EQ(offsetof(ProtoPidPayload, actual), 2u);
+    CHECK_EQ(offsetof(ProtoPidPayload, output), 4u);
 }
 
 /* ================================================================== */
@@ -589,6 +688,202 @@ static void test_stream_300(void)
 }
 
 /* ================================================================== */
+/* 11. 边界载荷长度：LEN = 0 与 LEN = PROTO_MAX_PAYLOAD               */
+/* ================================================================== */
+
+static void test_payload_limits(void)
+{
+    uint8_t  payload[PROTO_MAX_PAYLOAD];
+    uint8_t  frame[PROTO_MAX_FRAME];
+    size_t   n;
+    size_t   k;
+    uint32_t i;
+    ProtoParser p;
+
+    section("11. 边界载荷长度：LEN = 0 与 LEN = 32");
+
+    for (i = 0u; i < (uint32_t)PROTO_MAX_PAYLOAD; i++) {
+        payload[i] = (uint8_t)((i == 0u) ? 0xA5u : ((i == 1u) ? 0x5Au : (i * 13u + 7u)));
+    }
+
+    /* --- 零载荷：整帧只有 6 字节，LEN == 0，载荷指针仍然必须有效 --- */
+    n = Protocol_Pack(frame, sizeof(frame), PROTO_CMD_ACK, 0x40u, NULL, 0u);
+    CHECK_EQ(n, PROTO_OVERHEAD);
+    CHECK_EQ(frame[2], 0u);                     /* LEN 字段 = 0 */
+    CHECK_EQ(frame[3], 0x40u);
+
+    cap_reset();
+    Protocol_Init(&p, on_frame);
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, frame, n), 1u);
+    CHECK_EQ(g_cap_n, 1);
+    CHECK_EQ(g_cap[0].len, 0u);
+    CHECK_EQ(g_cap[0].seq, 0x40u);
+    CHECK_EQ(g_cap[0].cmd, PROTO_CMD_ACK);
+    CHECK_EQ(p.crc_error_count, 0u);
+
+    /* --- 满载荷：LEN == 32，整帧 38 字节，逐字节喂也必须一个字节不差 --- */
+    n = Protocol_Pack(frame, sizeof(frame), PROTO_CMD_DEBUG_TEXT, 0x41u,
+                      payload, (uint8_t)PROTO_MAX_PAYLOAD);
+    CHECK_EQ(n, PROTO_MAX_FRAME);
+    CHECK_EQ(frame[2], (uint8_t)PROTO_MAX_PAYLOAD);
+
+    cap_reset();
+    Protocol_Init(&p, on_frame);
+    for (k = 0u; k < n; k++) {
+        (void)Protocol_ParserFeed(&p, frame[k]);
+    }
+    CHECK_EQ(g_cap_n, 1);
+    CHECK_EQ(g_cap[0].len, (uint8_t)PROTO_MAX_PAYLOAD);
+    CHECK_EQ(g_cap[0].seq, 0x41u);
+    CHECK(memcmp(g_cap[0].payload, payload, (size_t)PROTO_MAX_PAYLOAD) == 0);
+    CHECK_EQ(p.frame_count, 1u);
+    CHECK_EQ(p.crc_error_count, 0u);
+
+    /* 满载荷且载荷全是帧头字节（A5 5A A5 5A ...）也不能误同步 */
+    for (k = 0u; k < (size_t)PROTO_MAX_PAYLOAD; k++) {
+        payload[k] = ((k % 2u) == 0u) ? PROTO_SOF1 : PROTO_SOF2;
+    }
+    n = Protocol_Pack(frame, sizeof(frame), PROTO_CMD_DEBUG_TEXT, 0x42u,
+                      payload, (uint8_t)PROTO_MAX_PAYLOAD);
+    cap_reset();
+    Protocol_Init(&p, on_frame);
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, frame, n), 1u);
+    CHECK_EQ(g_cap_n, 1);
+    CHECK(memcmp(g_cap[0].payload, payload, (size_t)PROTO_MAX_PAYLOAD) == 0);
+    CHECK_EQ(p.crc_error_count, 0u);
+}
+
+/* ================================================================== */
+/* 12. 假帧头拒绝、截断帧恢复                                         */
+/* ================================================================== */
+
+static void test_recovery(void)
+{
+    uint8_t  payload[6] = { 0xD0u, 0x07u, 0x68u, 0x01u, 0x2Cu, 0x01u };
+    uint8_t  frame[PROTO_MAX_FRAME];
+    uint8_t  buf[PROTO_MAX_FRAME * 2u];
+    size_t   n;
+    ProtoParser p;
+
+    section("12. 假帧头拒绝与截断帧恢复");
+
+    n = Protocol_Pack(frame, sizeof(frame), PROTO_CMD_PID_DATA, 0x5Cu, payload, 6u);
+
+    /* LEN = 33（超过 PROTO_MAX_PAYLOAD）必须被判为假帧头，且不许产生任何回调 */
+    cap_reset();
+    Protocol_Init(&p, on_frame);
+    CHECK_EQ(Protocol_ParserFeed(&p, PROTO_SOF1), PROTO_OK);
+    CHECK_EQ(Protocol_ParserFeed(&p, PROTO_SOF2), PROTO_OK);
+    CHECK_EQ(Protocol_ParserFeed(&p, (uint8_t)(PROTO_MAX_PAYLOAD + 1u)), PROTO_ERR_TOO_LONG);
+    CHECK_EQ(g_cap_n, 0);
+    CHECK_EQ(p.frame_count, 0u);
+    CHECK_EQ(p.crc_error_count, 0u);          /* 长度越界不算 CRC 错误 */
+
+    /* 越界之后必须还能重新同步出紧跟的真帧 */
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, frame, n), 1u);
+    CHECK_EQ(g_cap_n, 1);
+    CHECK_EQ(g_cap[0].seq, 0x5Cu);
+    CHECK(memcmp(g_cap[0].payload, payload, 6u) == 0);
+
+    /*
+     * 极端情形：A5 5A A5 5A 连着来（第二个 A5 落在长度字段位置上 = 165，越界）。
+     * 这时最后一个 A5 有可能才是真帧头的第一字节，必须被保留成候选帧头，
+     * 否则紧跟的真帧整帧丢掉。
+     */
+    buf[0] = PROTO_SOF1;
+    buf[1] = PROTO_SOF2;
+    buf[2] = PROTO_SOF1;
+    buf[3] = PROTO_SOF2;
+    memcpy(&buf[4], frame, n);
+    cap_reset();
+    Protocol_Init(&p, on_frame);
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, buf, 4u + n), 1u);
+    CHECK_EQ(g_cap_n, 1);
+    CHECK_EQ(g_cap[0].seq, 0x5Cu);
+    CHECK(memcmp(g_cap[0].payload, payload, 6u) == 0);
+
+    /*
+     * 截断帧（模拟串口丢了一个字节）：解析器会停在 VERIFY 等 CRC 字节，
+     * 于是紧跟的新帧的 0xA5 正好落到"校验字节"这个位置上。
+     * 这条断言锁死"校验失败时若该字节是 0xA5 就必须回 WAIT_SOF2"：
+     * 一旦改回 WAIT_SOF1，新帧的 0xA5 会被吞掉 —— 丢 1 个字节变成连丢 2 帧，
+     * 这里就会从 1 变成 0，测试立刻红。
+     */
+    cap_reset();
+    Protocol_Init(&p, on_frame);
+    (void)Protocol_ParserFeedBuffer(&p, frame, n - 1u);
+    CHECK_EQ(g_cap_n, 0);                     /* 截断的那一帧不许回调 */
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, frame, n), 1u);
+    CHECK_EQ(g_cap_n, 1);
+    CHECK_EQ(g_cap[0].seq, 0x5Cu);
+    CHECK(memcmp(g_cap[0].payload, payload, 6u) == 0);
+    CHECK_EQ(p.frame_count, 1u);
+    CHECK_EQ(p.crc_error_count, 1u);          /* 截断帧记一次校验失败 */
+
+    /* 坏帧夹在两帧好帧中间：坏帧被丢，后面的好帧必须完整解析出来 */
+    memcpy(buf, frame, n);
+    buf[7] = (uint8_t)(buf[7] ^ 0x01u);       /* 改坏载荷 -> CRC 必然不过 */
+    memcpy(&buf[n], frame, n);
+    cap_reset();
+    Protocol_Init(&p, on_frame);
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, buf, n * 2u), 1u);
+    CHECK_EQ(g_cap_n, 1);
+    CHECK_EQ(g_cap[0].seq, 0x5Cu);
+    CHECK(memcmp(g_cap[0].payload, payload, 6u) == 0);
+    CHECK_EQ(p.frame_count, 1u);
+    CHECK_EQ(p.crc_error_count, 1u);
+}
+
+/* ================================================================== */
+/* 13. NULL 安全 / 复位语义 / 状态名                                  */
+/* ================================================================== */
+
+static void test_api_edges(void)
+{
+    uint8_t  frame[PROTO_MAX_FRAME];
+    uint8_t  payload[2] = { 0x01u, 0x02u };
+    size_t   n;
+    ProtoParser p;
+
+    section("13. NULL 安全 / 复位语义 / 状态名");
+
+    /* 传 NULL 必须返回错误码，不许崩 */
+    CHECK_EQ(Protocol_ParserFeed(NULL, 0x00u), PROTO_ERR_NULL);
+    CHECK_EQ(Protocol_ParserFeedBuffer(NULL, frame, 4u), 0u);
+    Protocol_Init(&p, on_frame);
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, NULL, 0u), 0u);
+    Protocol_Init(NULL, on_frame);            /* 不许崩 */
+    Protocol_Reset(NULL);                     /* 不许崩 */
+
+    /* cb 传 NULL：只解析不回调，但计数照走 */
+    n = Protocol_Pack(frame, sizeof(frame), PROTO_CMD_ACK, 0x21u, payload, 2u);
+    cap_reset();
+    Protocol_Init(&p, NULL);
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, frame, n), 1u);
+    CHECK_EQ(p.frame_count, 1u);
+    CHECK_EQ(g_cap_n, 0);                     /* 没注册回调就不该有回调 */
+
+    /* Reset 只清状态，不清统计：串口出错重连时不该把丢帧统计也抹掉 */
+    Protocol_Reset(&p);
+    CHECK_EQ(p.state, PROTO_ST_WAIT_SOF1);
+    CHECK_EQ(p.index, 0u);
+    CHECK_EQ(p.need, 0u);
+    CHECK_EQ(p.frame_count, 1u);
+    CHECK_EQ(Protocol_ParserFeedBuffer(&p, frame, n), 1u);
+    CHECK_EQ(p.frame_count, 2u);
+
+    /* 状态名必须覆盖全部状态，未知状态也不能返回 NULL */
+    CHECK(Protocol_StateName(PROTO_ST_WAIT_SOF1) != NULL);
+    CHECK_EQ(strcmp(Protocol_StateName(PROTO_ST_WAIT_SOF1), "WAIT_SOF1"), 0);
+    CHECK_EQ(strcmp(Protocol_StateName(PROTO_ST_WAIT_SOF2), "WAIT_SOF2"), 0);
+    CHECK_EQ(strcmp(Protocol_StateName(PROTO_ST_READ_LEN), "READ_LEN"), 0);
+    CHECK_EQ(strcmp(Protocol_StateName(PROTO_ST_READ_BODY), "READ_BODY"), 0);
+    CHECK_EQ(strcmp(Protocol_StateName(PROTO_ST_VERIFY), "VERIFY"), 0);
+    CHECK(Protocol_StateName((ProtoState)99) != NULL);
+    CHECK_EQ(strcmp(Protocol_StateName((ProtoState)99), "UNKNOWN"), 0);
+}
+
+/* ================================================================== */
 /* main                                                               */
 /* ================================================================== */
 
@@ -609,6 +904,9 @@ int main(void)
     test_crc_error();
     test_struct_packing();
     test_stream_300();
+    test_payload_limits();
+    test_recovery();
+    test_api_edges();
 
     printf("\n========================================\n");
     printf(" 总计: %d 项通过, %d 项失败\n", g_pass, g_fail);
