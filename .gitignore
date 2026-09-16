@@ -1,0 +1,45 @@
+# 编译产物与临时文件
+*.o
+*.obj
+*.exe
+*.elf
+*.hex
+*.bin
+*.map
+*.axf
+*.lst
+*.d
+*.pdb
+*.ilk
+*.exp
+*.lib
+pidsim
+
+# Keil MDK
+*.uvguix.*
+*.scvd
+*.bak
+*.dep
+Objects/
+Listings/
+DebugConfig/
+RTE/
+JLinkLog.txt
+
+# STM32CubeMX 的缓存文件（.ioc 本身要提交，这个缓存不用）
+.mxproject
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,20 @@
+# 统一换行符，避免 Windows 上克隆下来 shell 脚本带 CRLF 无法执行
+* text=auto
+
+*.sh    text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.svg   text eol=lf
+*.csv   text eol=lf
+
+# PowerShell 脚本在 Windows 上以 CRLF 更稳妥；
+# 注意 build.ps1 必须带 UTF-8 BOM，否则 PowerShell 5.1 会按 ANSI 解码导致中文乱码、语法报错
+*.ps1   text eol=crlf
+
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.pdf   binary
